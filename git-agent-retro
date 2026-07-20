@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""
+git agent-retro — retroactively generate agent context for old commits.
+
+Analyzes each commit's diff, commit message, and file paths to reconstruct
+plausible agent reasoning context. Attaches as git notes.
+
+Usage:
+  git agent-retro                    # Process all commits without notes
+  git agent-retro --limit 10         # Process last 10 only
+  git agent-retro --since 2026-01-01 # Process commits since date
+  git agent-retro --commit HEAD      # Process single commit
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+NOTES_REF = "refs/notes/agent-context"
+
+# ── Commit type heuristics ──
+COMMIT_PREFIXES = {
+    "feat": ("feature", "added new functionality"),
+    "fix": ("bugfix", "fixed an issue"),
+    "docs": ("documentation", "updated documentation"),
+    "refactor": ("refactor", "restructured code without behavior change"),
+    "perf": ("performance", "performance improvement"),
+    "test": ("testing", "added or updated tests"),
+    "chore": ("maintenance", "maintenance or tooling change"),
+    "style": ("style", "code formatting or style change"),
+    "ci": ("CI/CD", "CI/CD configuration change"),
+}
+
+
+def run_git(*args):
+    result = subprocess.run(
+        ["git"] + list(args),
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode, result.stdout.strip(), result.stderr.strip()
+
+
+def classify_commit(subject, files, new_files=None):
+    """Classify commit type and generate context from heuristics.
+    
+    Args:
+        subject: Commit message subject
+        files: All changed files in the commit
+        new_files: Files that were newly added (diff-filter=A), optional
+    """
+    if new_files is None:
+        new_files = []
+    
+    subject_lower = subject.lower()
+    
+    # Detect if this commit ADDS a new blog post (new .md file in posts/)
+    is_new_post = any(
+        f.startswith("posts/") and f.endswith(".md") for f in new_files
+    )
+    # Detect if commit modifies existing posts (for blog updates/fixes)
+    is_post_update = not is_new_post and any(
+        f.startswith("posts/") for f in files
+    )
+    is_homepage = "index.html" in files
+    is_config = any(f.endswith("_config.yml") or f == ".nojekyll" or f == "CNAME" for f in files)
+    is_media = any(f.startswith("images/") or f.startswith("assets/") for f in files)
+
+    # Extract post slug if applicable
+    post_name = None
+    for f in files:
+        m = re.match(r"posts/(\d{4}-\d{2}-\d{2}-([^/]+))/", f)
+        if m:
+            post_name = m.group(2).replace("-", " ")
+            break
+
+    # Generate task & approach
+    if is_new_post and post_name:
+        task = f"Published new blog post: {post_name}"
+        approach = "Created markdown post file, generated static HTML, updated index"
+        alternatives = ["Write directly on GitHub", "Use a CMS"]
+        rejected = "Chose local workflow for better control over formatting"
+    elif is_new_post:
+        task = "Published new blog post"
+        approach = "Created new post files in posts/ directory"
+        alternatives = ["Write directly on GitHub", "Use a CMS"]
+        rejected = "Chose local workflow for better control over formatting"
+    elif is_post_update and subject_lower.startswith("fix"):
+        task = f"Fixed issues in blog posts: {subject[:60]}"
+        approach = "Edited post files to fix formatting, tags, or content issues"
+        alternatives = []
+        rejected = ""
+    elif is_post_update:
+        task = f"Updated blog posts: {subject[:60]}"
+        approach = "Modified existing post files"
+        alternatives = []
+        rejected = ""
+    elif is_homepage and len(files) <= 5:
+        task = "Updated blog homepage or site layout"
+        approach = "Modified index.html and related templates"
+        alternatives = []
+        rejected = ""
+    elif is_config:
+        task = "Updated site configuration"
+        approach = "Modified GitHub Pages / Jekyll config"
+        alternatives = []
+        rejected = ""
+    elif is_media:
+        task = "Added or updated media assets"
+        approach = "Added images or static assets to the blog"
+        alternatives = []
+        rejected = ""
+    else:
+        task = subject[:80] if len(subject) > 10 else "General update"
+        approach = f"Modified {len(files)} file(s)"
+        alternatives = []
+        rejected = ""
+
+    return {
+        "task": task,
+        "approach": approach,
+        "alternatives_considered": alternatives,
+        "rejected": rejected if alternatives else "",
+        "diff_rationale": f"Files changed: {', '.join(files[:5])}{' +more' if len(files) > 5 else ''}",
+        "relevant_sessions": [],
+        "agent_version": "git-agent-retro (heuristic)",
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+
+
+def get_commits_without_notes(limit=None, since=None):
+    """Get commits that don't have agent context notes yet."""
+    log_args = ["log", "--reverse", "--format=%H|||%s", "--no-merges"]
+    if since:
+        log_args.append(f"--since={since}")
+    if limit:
+        log_args.append(f"-{limit}")
+
+    rc, out, err = run_git(*log_args)
+    if rc != 0:
+        print(f"Error: {err}", file=sys.stderr)
+        return []
+
+    commits = []
+    for line in out.split("\n"):
+        if not line.strip():
+            continue
+        parts = line.split("|||")
+        if len(parts) < 2:
+            continue
+        sha, subject = parts[0], parts[1]
+
+        # Check if it already has a note
+        rc2, _, _ = run_git("notes", f"--ref={NOTES_REF}", "show", sha)
+        if rc2 == 0:
+            continue  # already has note
+
+        commits.append((sha, subject))
+
+    return commits
+
+
+def process_commit(sha, subject):
+    """Analyze a single commit and attach context."""
+    # Get changed files
+    rc, files_out, _ = run_git("diff-tree", "--no-commit-id", "--name-only", "-r", sha)
+    files = [f.strip() for f in files_out.split("\n") if f.strip()]
+
+    if not files:
+        return False
+
+    # Check which files were actually ADDED (new) vs modified
+    rc, new_files_out, _ = run_git(
+        "diff-tree", "--no-commit-id", "--name-only", "-r", 
+        "--diff-filter=A", sha
+    )
+    new_files = [f.strip() for f in new_files_out.split("\n") if f.strip()]
+
+    # Generate context from heuristics
+    context = classify_commit(subject, files, new_files)
+
+    # Add file list to diff_rationale
+    context["diff_rationale"] = f"Files: {', '.join(files[:5])}" + (
+        f" +{len(files) - 5} more" if len(files) > 5 else ""
+    )
+    context["_diff_stat"] = ""
+    rc, stat, _ = run_git("diff-tree", "--no-commit-id", "-r", "--stat", sha)
+    if stat:
+        context["_diff_stat"] = stat
+
+    # Store as git note
+    ctx_json = json.dumps(context, indent=2, ensure_ascii=False)
+    rc2, _, err2 = run_git("notes", f"--ref={NOTES_REF}", "add", "-f",
+                           "-m", ctx_json, sha)
+    return rc2 == 0
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="Retroactively generate agent context for old commits"
+    )
+    parser.add_argument("--limit", type=int, help="Number of commits to process")
+    parser.add_argument("--since", help="Process commits since date (e.g., 2026-01-01)")
+    parser.add_argument("--commit", help="Process a single commit SHA")
+    args = parser.parse_args()
+
+    if args.commit:
+        rc, subject, _ = run_git("log", "-1", "--format=%s", args.commit)
+        if rc != 0:
+            print(f"Commit {args.commit[:12]} not found", file=sys.stderr)
+            sys.exit(1)
+        commits = [(args.commit, subject)]
+    else:
+        commits = get_commits_without_notes(limit=args.limit, since=args.since)
+
+    if not commits:
+        print("All commits already have agent context notes!")
+        return
+
+    total = len(commits)
+    success = 0
+    errors = []
+
+    print(f"Processing {total} commit(s)...")
+
+    for i, (sha, subject) in enumerate(commits, 1):
+        short = sha[:12]
+        print(f"  [{i}/{total}] {short} {subject[:50]}", end="")
+
+        try:
+            ok = process_commit(sha, subject)
+            if ok:
+                success += 1
+                print(" ✓")
+            else:
+                errors.append((short, "attach failed"))
+                print(" ✗")
+        except Exception as e:
+            errors.append((short, str(e)))
+            print(f" ✗ ({e})")
+
+    print(f"\nDone: {success}/{total} commits annotated")
+    if errors:
+        print(f"Errors: {len(errors)}")
+        for sha, err in errors[:5]:
+            print(f"  {sha}: {err}")
+
+    if success > 0:
+        print(f"\nRun `git agent-index` to rebuild the index")
+        print(f"Push notes: `git push origin refs/notes/agent-context`")
+
+
+if __name__ == "__main__":
+    main()
