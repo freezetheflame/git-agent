@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""
+git agent-log — display commits with agent reasoning context.
+
+Shows git log with structured agent context notes inline.
+Supports keyword search across agent contexts.
+
+Usage:
+  git agent-log                # Recent commits with agent context
+  git agent-log --search "flash attention tiling"
+  git agent-log --json         # Raw JSON output for tooling
+  git agent-log -v             # Show diff stats
+  git agent-log -n 20          # Last 20 commits
+"""
+
+import json
+import subprocess
+import sys
+from datetime import datetime
+
+NOTES_REF = "refs/notes/agent-context"
+
+
+def run_git(*args):
+    result = subprocess.run(
+        ["git"] + list(args),
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode, result.stdout.strip(), result.stderr.strip()
+
+
+def get_commits_with_notes(count=10):
+    rc, out, err = run_git(
+        "log", f"-{count}",
+        "--format=%H|||%h|||%ai|||%an|||%s|||%D",
+        "--decorate=short",
+    )
+    if rc != 0:
+        print(f"Error: {err}", file=sys.stderr)
+        return []
+
+    commits = []
+    for line in out.split("\n"):
+        if not line.strip():
+            continue
+        parts = line.split("|||")
+        if len(parts) >= 5:
+            sha_full = parts[0]
+            sha_short = parts[1]
+            date = parts[2]
+            author = parts[3]
+            subject = parts[4]
+            refs = parts[5] if len(parts) > 5 else ""
+
+            rc2, note_out, _ = run_git("notes", f"--ref={NOTES_REF}", "show", sha_full)
+            context = None
+            if rc2 == 0 and note_out:
+                try:
+                    context = json.loads(note_out)
+                except json.JSONDecodeError:
+                    context = {"raw": note_out}
+
+            commits.append({
+                "sha": sha_full,
+                "sha_short": sha_short,
+                "date": date,
+                "author": author,
+                "subject": subject,
+                "refs": refs,
+                "context": context,
+            })
+    return commits
+
+
+def display_commit(c, verbose=False):
+    has_ctx = c["context"] is not None
+    refs_str = f" ({c['refs']})" if c['refs'] and c['refs'] != 'HEAD -> ' else ""
+    date_obj = datetime.fromisoformat(c['date'])
+    date_str = date_obj.strftime("%Y-%m-%d %H:%M")
+
+    print(f"\033[33mcommit {c['sha_short']}\033[0m{refs_str}")
+    print(f"  Author: {c['author']}")
+    print(f"  Date:   {date_str}")
+    print(f"  \033[34m{c['subject']}\033[0m")
+
+    if c["context"] and isinstance(c["context"], dict):
+        ctx = c["context"]
+        task = ctx.get("task", "")
+        approach = ctx.get("approach", "")
+        alternatives = ctx.get("alternatives_considered", [])
+        rejected = ctx.get("rejected", "")
+        rationale = ctx.get("diff_rationale", "")
+        sessions = ctx.get("relevant_sessions", [])
+        diff_stat = ctx.get("_diff_stat", "")
+
+        print(f"\n  \033[36m\u2501\u2501\u2501 Agent Context \u2501\u2501\u2501\033[0m")
+        if task:
+            print(f"  \033[33mTask:\033[0m {task[:100]}{chr(8230) if len(task) > 100 else ''}")
+        if approach:
+            print(f"  \033[33mApproach:\033[0m {approach[:120]}{chr(8230) if len(approach) > 120 else ''}")
+        if alternatives:
+            alts = ", ".join(a[:40] for a in alternatives[:3])
+            print(f"  \033[33mConsidered:\033[0m {alts}{chr(8230) if len(alternatives) > 3 else ''}")
+        if rationale:
+            print(f"  \033[33mRationale:\033[0m {rationale[:120]}{chr(8230) if len(rationale) > 120 else ''}")
+        if rejected:
+            print(f"  \033[33mRejected:\033[0m {rejected[:80]}{chr(8230) if len(rejected) > 80 else ''}")
+        if sessions:
+            print(f"  \033[33mSessions:\033[0m {', '.join(sessions)}")
+        if diff_stat and verbose:
+            print(f"  \033[33mDiff:\033[0m {diff_stat}")
+
+    print()
+
+
+def search_context(query, count=50):
+    rc, commits_out, _ = run_git("log", f"-{count}", "--format=%H")
+    if rc != 0:
+        return []
+
+    results = []
+    for sha in commits_out.split("\n"):
+        if not sha:
+            continue
+        rc2, note_out, _ = run_git("notes", f"--ref={NOTES_REF}", "show", sha)
+        if rc2 != 0 or not note_out:
+            continue
+        try:
+            ctx = json.loads(note_out)
+        except json.JSONDecodeError:
+            continue
+
+        text = json.dumps(ctx, ensure_ascii=False).lower()
+        if query.lower() in text:
+            rc3, short, _ = run_git("rev-parse", "--short", sha)
+            rc4, date, _ = run_git("log", "-1", "--format=%ai", sha)
+            rc5, subject, _ = run_git("log", "-1", "--format=%s", sha)
+            results.append({
+                "sha": sha,
+                "sha_short": short if rc3 == 0 else sha[:12],
+                "date": date if rc4 == 0 else "",
+                "subject": subject if rc5 == 0 else "",
+                "context": ctx,
+            })
+    return results
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Show git log with agent context")
+    parser.add_argument("-n", "--count", type=int, default=10, help="Number of commits")
+    parser.add_argument("--search", help="Keyword search across agent contexts")
+    parser.add_argument("--json", action="store_true", help="Raw JSON output")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Show diff stats")
+    args = parser.parse_args()
+
+    if args.search:
+        results = search_context(args.search, count=args.count)
+        if not results:
+            print(f"No agent context matches '{args.search}'")
+            return
+        if args.json:
+            print(json.dumps(results, indent=2, ensure_ascii=False))
+            return
+        print(f"\n\033[36m\u2501\u2501\u2501 Agent Context Search: \"{args.search}\" \u2501\u2501\u2501\033[0m\n")
+        for r in results:
+            c = {
+                "sha_short": r["sha_short"],
+                "date": r["date"],
+                "author": "",
+                "subject": r["subject"],
+                "refs": "",
+                "context": r["context"],
+            }
+            display_commit(c, verbose=args.verbose)
+        print(f"\033[2m{len(results)} result(s)\033[0m")
+        return
+
+    commits = get_commits_with_notes(count=args.count)
+    if args.json:
+        print(json.dumps(commits, indent=2, ensure_ascii=False))
+        return
+    if not commits:
+        print("No commits found.")
+        return
+    for c in commits:
+        display_commit(c, verbose=args.verbose)
+    with_ctx = sum(1 for c in commits if c["context"])
+    print(f"\033[2mShowing {len(commits)} commits, {with_ctx} with agent context\033[0m")
+
+
+if __name__ == "__main__":
+    main()

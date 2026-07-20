@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""
+git agent-commit — commit with agent reasoning context.
+
+Stores structured agent context as a git note alongside each commit.
+Supports semantic retrieval across agent sessions.
+
+Usage:
+  git agent-commit --context <context.json> [-m "msg" | -F msg_file] [--amend]
+  git agent-commit [-m "msg"]                    # interactive (human) mode
+
+Context JSON format:
+{
+  "task": "What was the overall task?",
+  "approach": "How was it done?",
+  "alternatives_considered": ["alt1", "alt2"],
+  "rejected": "Why certain approaches were rejected",
+  "diff_rationale": "Explanation of specific changes in the diff",
+  "relevant_sessions": ["session-id-1"],
+  "agent_version": "hermes-agent",
+  "timestamp": "auto-filled"
+}
+"""
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+
+CONTEXT_REF = "refs/notes/agent-context"
+
+
+def run_git(*args, capture=True):
+    result = subprocess.run(
+        ["git"] + list(args),
+        capture_output=capture,
+        text=True,
+    )
+    return result.returncode, result.stdout.strip(), result.stderr.strip()
+
+
+def get_diff_summary():
+    rc, out, err = run_git("diff", "--cached", "--stat")
+    if rc != 0:
+        rc, out, err = run_git("diff", "--stat")
+    return out or ""
+
+
+def context_template():
+    """Generate a context template for human editing."""
+    diff_summary = get_diff_summary()
+    return json.dumps({
+        "task": "",
+        "approach": "",
+        "alternatives_considered": [],
+        "rejected": "",
+        "diff_rationale": "",
+        "relevant_sessions": [],
+        "agent_version": "hermes-agent",
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }, indent=2, ensure_ascii=False)
+
+
+def prompt_for_context_interactive():
+    """Open editor for human to fill in context."""
+    template = context_template()
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        f.write(template)
+        fpath = f.name
+
+    editor = os.environ.get("GIT_EDITOR") or os.environ.get("EDITOR") or "vi"
+    subprocess.run([editor, fpath])
+
+    with open(fpath) as f:
+        try:
+            ctx = json.load(f)
+        except json.JSONDecodeError as e:
+            print(f"Invalid JSON: {e}", file=sys.stderr)
+            ctx = {}
+    os.unlink(fpath)
+    return ctx
+
+
+def store_note(commit_sha, context):
+    ctx_json = json.dumps(context, indent=2, ensure_ascii=False)
+    rc, out, err = run_git("notes", f"--ref={CONTEXT_REF}", "add", "-f",
+                           "-m", ctx_json, commit_sha)
+    if rc != 0:
+        print(f"Warning: failed to store note: {err}", file=sys.stderr)
+    return rc == 0
+
+
+def do_commit(msg, amend=False):
+    cmd = ["commit"]
+    if amend:
+        cmd.append("--amend")
+    if msg:
+        cmd.extend(["-m", msg])
+
+    rc, out, err = run_git(*cmd)
+    if rc != 0:
+        print(err, file=sys.stderr)
+        return None
+
+    rc, sha, _ = run_git("rev-parse", "HEAD")
+    return sha if rc == 0 else None
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Commit with agent reasoning context")
+    parser.add_argument("-m", "--message", help="Commit message")
+    parser.add_argument("-F", "--file", help="Read commit message from file")
+    parser.add_argument("--context", help="Path to context JSON file (agent mode)")
+    parser.add_argument("--amend", action="store_true", help="Amend last commit")
+    args = parser.parse_args()
+
+    msg = None
+    if args.file:
+        with open(args.file) as f:
+            msg = f.read().strip()
+    elif args.message:
+        msg = args.message
+
+    if args.context:
+        with open(args.context) as f:
+            context = json.load(f)
+    else:
+        print("--- Agent Context (fill in reasoning for this change) ---")
+        context = prompt_for_context_interactive()
+        if not context.get("task"):
+            print("No context provided, committing without note.", file=sys.stderr)
+
+    if "timestamp" not in context:
+        context["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    context["_diff_stat"] = get_diff_summary()
+
+    sha = do_commit(msg, amend=args.amend)
+    if not sha:
+        print("Commit failed or nothing to commit.", file=sys.stderr)
+        sys.exit(1)
+
+    if context.get("task"):
+        store_note(sha, context)
+        print(f"✓ Agent context attached to commit {sha[:12]}")
+    else:
+        print(f"✓ Commit {sha[:12]} (no agent context)")
+
+    print()
+    print("Retrieve with:")
+    print(f"  git agent-log")
+    print(f"  git notes --ref={CONTEXT_REF} show HEAD")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""
+git agent-index — build and manage a searchable index of agent contexts.
+
+Builds a flat-file index (.git/agent-context-index.json) for fast retrieval
+of agent reasoning across the full commit history.
+
+Usage:
+  git agent-index                  # Build/refresh the full index
+  git agent-index --commit HEAD    # Index a specific commit
+  git agent-index --query "flash"  # Keyword search
+  git agent-index --stats          # Show index statistics
+"""
+
+import json
+import os
+import subprocess
+import sys
+import time
+
+INDEX_FILE = ".git/agent-context-index.json"
+NOTES_REF = "refs/notes/agent-context"
+
+
+def run_git(*args):
+    result = subprocess.run(
+        ["git"] + list(args),
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode, result.stdout.strip(), result.stderr.strip()
+
+
+def index_all():
+    """Index all commits with agent context notes across all branches."""
+    rc, out, err = run_git("log", "--all", "--format=%H|||%ai|||%s|||%an")
+    if rc != 0:
+        print(f"Error reading log: {err}", file=sys.stderr)
+        return []
+
+    entries = []
+    for line in out.split("\n"):
+        if not line.strip():
+            continue
+        parts = line.split("|||")
+        if len(parts) < 4:
+            continue
+
+        sha, date, subject, author = parts[0], parts[1], parts[2], parts[3]
+
+        rc2, note_out, _ = run_git("notes", f"--ref={NOTES_REF}", "show", sha)
+        if rc2 != 0 or not note_out:
+            continue
+
+        try:
+            ctx = json.loads(note_out)
+        except json.JSONDecodeError:
+            continue
+
+        entries.append({
+            "commit": sha,
+            "date": date,
+            "subject": subject,
+            "author": author,
+            "context": {
+                "task": ctx.get("task", ""),
+                "approach": ctx.get("approach", ""),
+                "alternatives_considered": ctx.get("alternatives_considered", []),
+                "rejected": ctx.get("rejected", ""),
+                "diff_rationale": ctx.get("diff_rationale", ""),
+                "relevant_sessions": ctx.get("relevant_sessions", []),
+            }
+        })
+
+    index_data = {
+        "version": 2,
+        "built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "total_entries": len(entries),
+        "entries": entries,
+    }
+
+    with open(INDEX_FILE, "w") as f:
+        json.dump(index_data, f, indent=2, ensure_ascii=False)
+
+    return entries
+
+
+def index_commit(sha):
+    """Index a single commit."""
+    rc, note_out, _ = run_git("notes", f"--ref={NOTES_REF}", "show", sha)
+    if rc != 0:
+        print(f"No agent context for {sha[:12]}", file=sys.stderr)
+        return False
+
+    rc2, date, _ = run_git("log", "-1", "--format=%ai", sha)
+    rc3, subject, _ = run_git("log", "-1", "--format=%s", sha)
+    rc4, author, _ = run_git("log", "-1", "--format=%an", sha)
+
+    try:
+        ctx = json.loads(note_out)
+    except json.JSONDecodeError:
+        return False
+
+    if os.path.exists(INDEX_FILE):
+        with open(INDEX_FILE) as f:
+            index_data = json.load(f)
+    else:
+        index_data = {"version": 2, "entries": []}
+
+    index_data["entries"] = [
+        e for e in index_data["entries"] if e.get("commit") != sha
+    ]
+
+    index_data["entries"].append({
+        "commit": sha,
+        "date": date if rc2 == 0 else "",
+        "subject": subject if rc3 == 0 else "",
+        "author": author if rc4 == 0 else "",
+        "context": {
+            "task": ctx.get("task", ""),
+            "approach": ctx.get("approach", ""),
+            "alternatives_considered": ctx.get("alternatives_considered", []),
+            "rejected": ctx.get("rejected", ""),
+            "diff_rationale": ctx.get("diff_rationale", ""),
+            "relevant_sessions": ctx.get("relevant_sessions", []),
+        }
+    })
+    index_data["total_entries"] = len(index_data["entries"])
+    index_data["built_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    with open(INDEX_FILE, "w") as f:
+        json.dump(index_data, f, indent=2, ensure_ascii=False)
+
+    return True
+
+
+def query_index(query, limit=10):
+    if not os.path.exists(INDEX_FILE):
+        print("No index found. Run `git agent-index` first.", file=sys.stderr)
+        return []
+
+    with open(INDEX_FILE) as f:
+        index_data = json.load(f)
+
+    q = query.lower()
+    results = []
+    for entry in index_data["entries"]:
+        text = json.dumps(entry["context"], ensure_ascii=False).lower()
+        if q in text or q in entry.get("subject", "").lower():
+            results.append(entry)
+
+    results.sort(key=lambda x: x.get("date", ""), reverse=True)
+    return results[:limit]
+
+
+def show_stats():
+    if not os.path.exists(INDEX_FILE):
+        print("No index found. Run `git agent-index` first.")
+        return
+
+    with open(INDEX_FILE) as f:
+        index_data = json.load(f)
+
+    entries = index_data["entries"]
+    total = len(entries)
+
+    if total == 0:
+        print("Index is empty.")
+        return
+
+    with_sessions = sum(1 for e in entries if e["context"].get("relevant_sessions"))
+    with_rejected = sum(1 for e in entries if e["context"].get("rejected"))
+    with_alternatives = sum(1 for e in entries if e["context"].get("alternatives_considered"))
+    dates = [e.get("date", "") for e in entries if e.get("date")]
+    dates.sort()
+    date_range = f"{dates[0][:10]} \u2192 {dates[-1][:10]}" if dates else "N/A"
+
+    print(f"\n  Agent Context Index")
+    print(f"  {'='*40}")
+    print(f"  Version:    {index_data.get('version', '?')}")
+    print(f"  Built:      {index_data.get('built_at', '?')}")
+    print(f"  Entries:    {total}")
+    print(f"  Date range: {date_range}")
+    print(f"  With sessions:  {with_sessions}")
+    print(f"  With rejected:  {with_rejected}")
+    print(f"  With alternatives: {with_alternatives}")
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Manage agent context index")
+    parser.add_argument("--commit", help="Index a specific commit SHA")
+    parser.add_argument("--query", help="Keyword search across agent contexts")
+    parser.add_argument("--stats", action="store_true", help="Show index statistics")
+    parser.add_argument("--limit", type=int, default=10, help="Max results for search")
+    args = parser.parse_args()
+
+    if args.stats:
+        show_stats()
+    elif args.query:
+        results = query_index(args.query, limit=args.limit)
+        if not results:
+            print(f"No results for '{args.query}'")
+            return
+        print(json.dumps(results, indent=2, ensure_ascii=False))
+    elif args.commit:
+        if index_commit(args.commit):
+            print(f"\u2713 Indexed {args.commit[:12]}")
+        else:
+            sys.exit(1)
+    else:
+        entries = index_all()
+        print(f"\u2713 Index built: {len(entries)} commits with agent context")
+
+
+if __name__ == "__main__":
+    main()
